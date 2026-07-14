@@ -19,8 +19,28 @@ Read this whole file before running anything.
 - `.env.dspark` holds cluster values. Read it first. `WORKER_HOST` is the
   worker's SSH address; `MASTER_ADDR`/`VLLM_HOST_IP`/`WORKER_VLLM_HOST_IP` are
   fabric IPs; NCCL_* are load-bearing.
-- Worker commands: `ssh $WORKER_HOST '<cmd>'`. The repo's own scripts already
-  rsync/ssh to the worker (see `build-dspark-vllm-runtime.sh`,
+- **Network identity of this rig** (validated in
+  <https://contact.alessandrosangiorgi.net/posts/dgx-spark-roce-link-validation/>):
+  - SSH user on both Sparks: `alessangiorgi`. Worker SSH target:
+    `alessangiorgi@10.0.0.2` (over the point-to-point RoCE link; ssh omits the
+    user when you are already logged in as `alessangiorgi`).
+  - Head (master) fabric IP: `10.0.0.1`; worker fabric IP: `10.0.0.2`
+    (`10.0.0.0/30` link subnet, MTU **9000**).
+  - RDMA device: **`rocep1s0f0`**; its Ethernet netdev: **`enp1s0f0np0`**
+    (the Spark exposes four RoCE devices across two PCI paths, `p1s0` and
+    `P2p1s0`, dual-port each — the cabled/ACTIVE port on this rig is
+    `p1s0f0`). So: `NCCL_IB_HCA=rocep1s0f0`,
+    `NCCL_SOCKET_IFNAME=enp1s0f0np0`. If a NCCL start ever reports
+    `NET/Socket`, verify the ACTIVE port first (`ip addr show enp1s0f0np0`,
+    link state + 10.0.0.x address present on BOTH nodes) — a moved cable
+    changes the `f0`/`f1` suffix.
+  - Validated raw-link reference: ~109 Gbps bandwidth, ~1.45 µs latency. If a
+    perftest shows far less, fix the link before benchmarking anything.
+  - Extra NCCL env the link validation used (apply when diagnosing transport
+    problems): `NCCL_NET_PLUGIN=none`, `NCCL_IB_MERGE_NICS=1`.
+- Worker commands: `ssh alessangiorgi@10.0.0.2 '<cmd>'` (i.e.
+  `ssh $WORKER_HOST ...`). The repo's own scripts already rsync/ssh to the
+  worker (see `build-dspark-vllm-runtime.sh`,
   `start-deepseek-v4-flash-dspark.sh`) — prefer them over hand-rolled loops.
 - Two stacks exist:
   1. **Fork stack** (this repo): overlay on the `unholy-fusion` image,

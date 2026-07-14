@@ -534,17 +534,25 @@ Edit these values for your cluster:
 - `WORKER_HF_CACHE` if the worker cache path differs from the head
 - `VLLM_HOST_IP` and `WORKER_VLLM_HOST_IP` for each node's fabric IP
 
-For this local setup the key values are:
+For this local setup the key values are (device names per the
+[RoCE link validation guide](https://contact.alessandrosangiorgi.net/posts/dgx-spark-roce-link-validation/)
+— the cabled/ACTIVE port on this rig is `p1s0f0`; verify with
+`ip addr show enp1s0f0np0` on both nodes if the cable has moved, since the
+`f0`/`f1` suffix follows the physical port):
 
 ```env
-WORKER_HOST=10.0.0.2
+WORKER_HOST=alessangiorgi@10.0.0.2
 MASTER_ADDR=10.0.0.1
 VLLM_HOST_IP=10.0.0.1
 WORKER_VLLM_HOST_IP=10.0.0.2
 MASTER_PORT=25000
-NCCL_IB_HCA=rocep1s0f1
-NCCL_SOCKET_IFNAME=enp1s0f1np1
+NCCL_IB_HCA=rocep1s0f0
+NCCL_SOCKET_IFNAME=enp1s0f0np0
 ```
+
+The link runs `10.0.0.0/30` at MTU 9000 and validated at ~109 Gbps / ~1.45 µs;
+`NCCL_NET_PLUGIN=none` and `NCCL_IB_MERGE_NICS=1` are useful when diagnosing
+NCCL transport selection.
 
 Keep these agent-serving defaults unless you are deliberately experimenting:
 

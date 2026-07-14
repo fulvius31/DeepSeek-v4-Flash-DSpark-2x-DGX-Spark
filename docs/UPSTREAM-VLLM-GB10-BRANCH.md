@@ -291,7 +291,12 @@ Run the same gates the fork stack was validated with, in this order:
 - **NCCL falls back to sockets** (decode ~3–5 tok/s): check
   `NCCL_DEBUG=INFO` for the transport line; verify `NCCL_IB_HCA`,
   `NCCL_IB_GID_INDEX`, and `/dev/infiniband` passthrough. This is the
-  TCP-death mode — the fabric settings are load-bearing.
+  TCP-death mode — the fabric settings are load-bearing. On this rig the
+  validated devices are `rocep1s0f0`/`enp1s0f0np0` at MTU 9000 (head
+  `10.0.0.1`, worker `10.0.0.2`; see the
+  [RoCE link validation guide](https://contact.alessandrosangiorgi.net/posts/dgx-spark-roce-link-validation/)
+  — expect ~109 Gbps / ~1.45 µs raw; `NCCL_NET_PLUGIN=none` and
+  `NCCL_IB_MERGE_NICS=1` help when diagnosing transport selection).
 - **OOM-killed workers under load** — disable earlyoom on both hosts
   (`sudo systemctl stop earlyoom && sudo systemctl disable earlyoom`).
 - **Model resolves to a download** — set `DSPARK_MODEL` to the exact repo id

@@ -136,7 +136,7 @@ services:
         --max-num-batched-tokens ${MAX_NUM_BATCHED_TOKENS:-8192}
         --gpu-memory-utilization ${GPU_MEMORY_UTILIZATION:-0.80}
         --enable-prefix-caching
-        --speculative-config "${SPECULATIVE_CONFIG}"
+        --speculative-config '${SPECULATIVE_CONFIG}'
         --tokenizer-mode deepseek_v4
         --tool-call-parser deepseek_v4
         --enable-auto-tool-choice
@@ -151,21 +151,28 @@ services:
         ${HEADLESS:+--headless}
 ```
 
+The `--speculative-config` value must be **single-quoted** in the compose
+command. The service runs under `bash -lc`, so a double-quoted
+`"${SPECULATIVE_CONFIG}"` lets bash strip the JSON's own double quotes and vLLM
+receives `{method:dspark,...}` — invalid JSON, and startup dies in the config
+parser. Single quotes pass the JSON through verbatim (it contains no single
+quotes). Same reason `--default-chat-template-kwargs` below is single-quoted.
+
 Two speculative profiles (set `SPECULATIVE_CONFIG` in the environment or
 `.env.dspark`):
 
 ```bash
 # Profile A — probabilistic drafting (closest to the fork's C12 profile).
 # Only W1 replication applies (local argmax is greedy-only by design).
-SPECULATIVE_CONFIG='{"method":"dspark","num_speculative_tokens":3,"draft_sample_method":"probabilistic","replicate_markov_w1":true}'
+SPECULATIVE_CONFIG='{"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"probabilistic","replicate_markov_w1":true}'
 
 # Profile B — greedy drafting, both optimizations (zero vocab-scale
 # collectives in the draft loop):
-SPECULATIVE_CONFIG='{"method":"dspark","num_speculative_tokens":3,"replicate_markov_w1":true,"use_local_argmax_reduction":true}'
+SPECULATIVE_CONFIG='{"method":"dspark","num_speculative_tokens":5,"replicate_markov_w1":true,"use_local_argmax_reduction":true}'
 ```
 
 For baseline A/B runs, drop the extra fields:
-`'{"method":"dspark","num_speculative_tokens":3}'` (add
+`'{"method":"dspark","num_speculative_tokens":5}'` (add
 `"draft_sample_method":"probabilistic"` for the probabilistic baseline).
 
 ## Step 5 — launch (worker first, same as the fork stack)
@@ -233,7 +240,7 @@ seconds. Isolate each variable before spending time on the big one.
    problem (`NCCL_IB_HCA`, `NCCL_IB_GID_INDEX`, `VLLM_HOST_IP` per node,
    master addr/port reachability).
 6. **Real model, baseline profile** — `MAX_MODEL_LEN=200000`,
-   `SPECULATIVE_CONFIG='{"method":"dspark","num_speculative_tokens":3,"draft_sample_method":"probabilistic"}'`
+   `SPECULATIVE_CONFIG='{"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"probabilistic"}'`
    (no new flags yet). Watch boot logs for the attention backend line (SM120
    sparse MLA), the KV pool size, and `Application startup complete`. Then
    `curl /v1/models` + the repo smoke test.

@@ -1,0 +1,51 @@
+# Tiny-model TP=2 bring-up gate (runbook "First-time bring-up" step 5).
+# Validates NCCL-over-RoCE + multi-node mp machinery in seconds per attempt,
+# with no speculation and no DeepSeek-specific parsers/KV dtype.
+services:
+  vllm-upstream:
+    image: vllm-upstream-gb10:dspark-tp
+    network_mode: host
+    ipc: host
+    shm_size: "64gb"
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    gpus: all
+    devices:
+      - /dev/infiniband:/dev/infiniband
+    volumes:
+      - ${HF_CACHE:-${HOME}/.cache/huggingface}:/cache/huggingface
+    environment:
+      HF_HOME: /cache/huggingface
+      HF_HUB_OFFLINE: "0"
+      VLLM_HOST_IP: "${VLLM_HOST_IP:-}"
+      FLASHINFER_CUDA_ARCH_LIST: "12.1a"
+      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+      NCCL_NET: "IB"
+      NCCL_IB_DISABLE: "0"
+      NCCL_IB_HCA: "${NCCL_IB_HCA}"
+      NCCL_SOCKET_IFNAME: "${NCCL_SOCKET_IFNAME}"
+      GLOO_SOCKET_IFNAME: "${NCCL_SOCKET_IFNAME}"
+      NCCL_IB_GID_INDEX: "${NCCL_IB_GID_INDEX:-}"
+      NCCL_CROSS_NIC: "1"
+      NCCL_CUMEM_ENABLE: "0"
+      NCCL_DEBUG: "INFO"
+      NCCL_NVLS_ENABLE: "0"
+    entrypoint: ["bash", "-lc"]
+    command:
+      - >
+        exec vllm serve ${TINY_MODEL:-Qwen/Qwen2.5-0.5B-Instruct}
+        --served-model-name tiny
+        --host ${VLLM_HOST:-127.0.0.1}
+        --port 8888
+        --tensor-parallel-size 2
+        --pipeline-parallel-size 1
+        --max-model-len 4096
+        --max-num-seqs 4
+        --gpu-memory-utilization 0.30
+        --distributed-executor-backend mp
+        --nnodes 2
+        --node-rank ${NODE_RANK}
+        --master-addr ${MASTER_ADDR}
+        --master-port ${MASTER_PORT:-25000}
+        ${HEADLESS:+--headless}

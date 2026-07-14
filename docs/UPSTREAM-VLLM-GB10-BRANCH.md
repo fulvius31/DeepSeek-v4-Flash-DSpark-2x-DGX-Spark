@@ -255,6 +255,24 @@ Run the same gates the fork stack was validated with, in this order:
    this exercises the code paths where the fork needed the Keys patches;
    upstream's architecture is different, so watch for crashes or acceptance
    collapse and report either upstream.
+4b. **Corruption soak — the decisive gate.** The fork stack has a known
+   speculation+concurrency corruption bug (README "Known issue"). Upstream
+   reimplements that machinery entirely (paged draft KV, padded static
+   batches, no hand-rolled ring buffers), so this test is what proves whether
+   the bug class is actually gone:
+
+   ```bash
+   # Run against the upstream endpoint at production-like temperature.
+   python3 scripts/dspark-corruption-soak.py \
+     --base-url http://<head>:8888/v1 --model deepseek-v4-flash-dspark \
+     --concurrency 4 --turns 12 --temperature 0.6 --label upstream-spec-on
+   ```
+
+   Exit 0 = clean, exit 2 = corruption detected (prints the signatures).
+   Run the same command against the fork stack for the A/B. Restart the
+   server between runs (prefix-cache reset); the harness always builds fresh
+   client sessions, so a healthy server is never blamed for a poisoned
+   client history.
 5. **Collective count sanity**: rerun once with `NCCL_DEBUG=INFO` and confirm
    the per-step all-gather traffic drops between baseline and Profile B.
 6. Only after all of the above: raise `MAX_MODEL_LEN` toward 1048576 (keep

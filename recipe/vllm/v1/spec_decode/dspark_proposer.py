@@ -730,6 +730,56 @@ class DSparkProposer(SpecDecodeBaseProposer):
         self._last_confidence = None
         return confidence
 
+    def _skip_speculation_this_step(
+        self,
+        batch_size: int,
+        next_token_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return a draft the engine will schedule as ZERO speculative tokens.
+
+        Keeps the [batch, num_speculative_tokens] shape contract, but sets
+        every per-request draft length to zero so the runner trims each row
+        to empty before scheduling. Never surface the placeholder ids as real
+        drafts: token id 0 is a live vocabulary entry (begin-of-sentence),
+        and pairing fabricated ids with stale or absent draft probabilities
+        lets probabilistic rejection sampling occasionally ACCEPT them
+        (observed as literal <|begin_of_sentence|> markers and isolated junk
+        tokens in concurrent agent sessions).
+        """
+        self._last_draft_lengths = [0] * batch_size
+        self._last_draft_probs = None
+        self._last_confidence = None
+        return next_token_ids.new_zeros(
+            (batch_size, self.num_speculative_tokens)
+        )
+
+    def _should_skip_ragged_speculation(self) -> bool:
+        cached = getattr(self, "_skip_ragged_speculation", None)
+        if cached is None:
+            cached = os.getenv(
+                "VLLM_DSPARK_SKIP_RAGGED_SPECULATION", "0"
+            ).strip().lower() in {"1", "true", "yes", "on"}
+            self._skip_ragged_speculation = cached
+        return cached
+
+    @staticmethod
+    def _step_is_ragged(batch_size: int, common_attn_metadata) -> bool:
+        """True when per-request query rows are non-uniform (a mixed
+        prefill/decode step under chunked prefill)."""
+        if common_attn_metadata is None:
+            return False
+        qsl_cpu = getattr(common_attn_metadata, "query_start_loc_cpu", None)
+        if qsl_cpu is None:
+            qsl = getattr(common_attn_metadata, "query_start_loc", None)
+            if qsl is None:
+                return False
+            qsl_cpu = qsl.cpu()
+        starts = qsl_cpu.tolist()
+        if len(starts) != batch_size + 1:
+            return False
+        seg_lengths = [starts[i + 1] - starts[i] for i in range(batch_size)]
+        return len(set(seg_lengths)) != 1
+
     def _maybe_store_draft_probs(
         self,
         draft_logits: torch.Tensor,
@@ -805,9 +855,27 @@ class DSparkProposer(SpecDecodeBaseProposer):
                     batch_size,
                 )
                 self._nonuniform_step_warned = True
-            return next_token_ids.new_zeros(
-                (batch_size, self.num_speculative_tokens)
-            )
+            return self._skip_speculation_this_step(batch_size, next_token_ids)
+
+        # Optional conservative mode: skip speculation on ANY mixed
+        # prefill/decode step (non-uniform per-request query rows), even when
+        # the ragged path could handle it. Uniform decode-only steps -- the
+        # steady-state majority -- keep full speculation, so most of the MTP
+        # speedup is retained while the suspect ragged machinery never runs.
+        if (
+            batch_size > 1
+            and self._should_skip_ragged_speculation()
+            and self._step_is_ragged(batch_size, common_attn_metadata)
+        ):
+            if not getattr(self, "_ragged_skip_logged", False):
+                logger.info(
+                    "DSpark proposer: VLLM_DSPARK_SKIP_RAGGED_SPECULATION=1 "
+                    "- skipping speculation on mixed prefill/decode steps; "
+                    "uniform decode steps keep full speculation. Further "
+                    "occurrences will not be logged."
+                )
+                self._ragged_skip_logged = True
+            return self._skip_speculation_this_step(batch_size, next_token_ids)
 
         # Resolve the stable per-request KV slot for this step. The map is
         # always advanced (reclaim/assign) so it stays consistent across steps,

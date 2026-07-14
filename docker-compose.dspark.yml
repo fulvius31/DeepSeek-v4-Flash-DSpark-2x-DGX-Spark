@@ -53,6 +53,12 @@ services:
       VLLM_DSPARK_REPLICATE_MARKOV_W1: "${VLLM_DSPARK_REPLICATE_MARKOV_W1:-1}"
       VLLM_DSPARK_FUSED_MARKOV_ARGMAX: "${VLLM_DSPARK_FUSED_MARKOV_ARGMAX:-0}"
       VLLM_DSPARK_GPU_REJECTED_CONTEXT_MASK: "${VLLM_DSPARK_GPU_REJECTED_CONTEXT_MASK:-1}"
+      # Corruption-mitigation ladder (see README "Known issue"): skip
+      # speculation on mixed prefill/decode steps (keeps it on uniform decode
+      # steps); draft sampling method; greedy verification override.
+      VLLM_DSPARK_SKIP_RAGGED_SPECULATION: "${VLLM_DSPARK_SKIP_RAGGED_SPECULATION:-0}"
+      DRAFT_SAMPLE_METHOD: "${DRAFT_SAMPLE_METHOD:-probabilistic}"
+      GREEDY_VERIFICATION: "${GREEDY_VERIFICATION:-0}"
       VLLM_DSPARK_REFERENCE_KV_QUANT_DEQUANT: "${VLLM_DSPARK_REFERENCE_KV_QUANT_DEQUANT:-0}"
       VLLM_DSPARK_HARDWARE_SCHEDULER_EARLY_STOP: "${VLLM_DSPARK_HARDWARE_SCHEDULER_EARLY_STOP:-1}"
       VLLM_DSV4_B12X_COMPRESSED_MLA: "${VLLM_DSV4_B12X_COMPRESSED_MLA:-0}"
@@ -99,7 +105,15 @@ services:
           export VLLM_PLUGINS="$${VLLM_PLUGINS:-gb10_hybrid_nvfp4}";
           VLLM_QUANTIZATION_ARGS="--quantization modelopt_gb10_hybrid";
         fi;
-        SPECULATIVE_CONFIG="{\"method\":\"dspark\",\"num_speculative_tokens\":$${MTP_NUM_TOKENS:-3},\"draft_sample_method\":\"probabilistic\"}";
+        SPECULATIVE_CONFIG="{\"method\":\"dspark\",\"num_speculative_tokens\":$${MTP_NUM_TOKENS:-3},\"draft_sample_method\":\"$${DRAFT_SAMPLE_METHOD:-probabilistic}\"}";
+        SPEC_ARGS=();
+        if [ "$${MTP_NUM_TOKENS:-3}" != "0" ]; then
+          SPEC_ARGS=(--speculative-config "$${SPECULATIVE_CONFIG}");
+        fi;
+        GEN_OVERRIDE_ARGS=();
+        if [ "$${GREEDY_VERIFICATION:-0}" = "1" ]; then
+          GEN_OVERRIDE_ARGS=(--override-generation-config "{\"temperature\":0.0,\"top_p\":1.0}");
+        fi;
         exec /opt/env/bin/vllm serve ${DSPARK_MODEL:-deepseek-ai/DeepSeek-V4-Flash-DSpark}
         --served-model-name ${SERVED_MODEL_NAME:-deepseek-v4-flash-dspark}
         --host ${VLLM_HOST:-127.0.0.1}
@@ -118,7 +132,7 @@ services:
         --enable-prefix-caching
         --async-scheduling
         --enable-chunked-prefill
-        --speculative-config "$${SPECULATIVE_CONFIG}"
+        "$${SPEC_ARGS[@]}"
         --tokenizer-mode deepseek_v4
         --distributed-executor-backend mp
         --tool-call-parser deepseek_v4
@@ -127,6 +141,7 @@ services:
         --reasoning-config '{"reasoning_parser":"deepseek_v4","reasoning_start_str":"<think>","reasoning_end_str":"</think>"}'
         --default-chat-template-kwargs '{"thinking":false}'
         --generation-config vllm
+        "$${GEN_OVERRIDE_ARGS[@]}"
         --enable-flashinfer-autotune
         --nnodes 2
         --node-rank ${NODE_RANK}

@@ -387,6 +387,52 @@ This keeps NVFP4 KV and MTP3. Do not switch to fp8 or drop to a smaller fallback
 model just to hide the symptom unless you intentionally accept the context and
 quality tradeoff.
 
+## Known issue: output corruption under speculation + concurrency
+
+> [!WARNING]
+> Long agentic sessions with **more than one request decoding concurrently and
+> speculative decoding enabled** have shown silent output corruption on this
+> stack: isolated junk tokens (random CJK/Greek/rare-vocab) inside coherent
+> text, literal `<|begin_of_sentence|>` emitted as text followed by replay of
+> stale earlier answers (prefix caching makes one corrupted committed token
+> poison the session's cached prefix for every later turn), generation jumping
+> into verbatim copies of earlier context, and DSML tool markup leaking as
+> plain text. Bisection: sampling overrides and `draft_sample_method=greedy`
+> did not help; `MTP_NUM_TOKENS=0` (speculation off) removed it completely.
+
+**Root-cause status.** One concrete defect is identified and fixed in-tree:
+the proposer's non-uniform-batch guard used to *fabricate* `[batch, K]` drafts
+of token id `0` (a live vocab entry — begin-of-sentence) instead of signalling
+"no proposal", and those fabricated drafts reached probabilistic rejection
+sampling paired with stale-or-absent draft probabilities, which can accept
+them. The guard now sets per-request draft lengths to zero so the runner
+schedules **no** speculative tokens for that step (`dspark_proposer.py`,
+`_skip_speculation_this_step`). Note the timeline: the 2026-06-30 checkpoint
+forced `temperature 0.0` (greedy verification rejects fabricated drafts by
+construction) and validated clean; C12 removed that override, opening the
+window. Whether further misalignment exists in the ragged path remains
+unproven — hence the ladder below.
+
+**Mitigation ladder** (in increasing order of speedup sacrificed):
+
+| level | knob | effect |
+| --- | --- | --- |
+| 0 (always on) | fixed guard | guard-fired steps schedule zero spec tokens instead of fabricated id-0 drafts |
+| 1 | `VLLM_DSPARK_SKIP_RAGGED_SPECULATION=1` | skip speculation on **mixed prefill/decode steps only**; uniform decode steps (the steady-state majority) keep full speculation — the suspect ragged machinery never runs |
+| 2 | `GREEDY_VERIFICATION=1` | server forces `temperature 0.0/top_p 1.0` (the clean 2026-06-30 profile); full speculation speedup, deterministic outputs |
+| 3 | `MTP_NUM_TOKENS=0` | speculation fully off (now correctly omits `--speculative-config`); ~52–57 → ~18–19 tok/s single-stream |
+
+`DRAFT_SAMPLE_METHOD` (default `probabilistic`) is also parameterized for
+bisection.
+
+**Validation gotcha:** a client session whose history already contains leaked
+markers keeps *imitating* them against a healthy server. Verify any fix with a
+server restart (prefix cache reset) **and fresh client sessions** — use
+`scripts/dspark-corruption-soak.py`, which builds fresh sessions and detects
+the corruption signatures automatically. The upstream-vLLM lane
+(`docs/UPSTREAM-VLLM-GB10-BRANCH.md`) reimplements this machinery entirely and
+must pass the same soak before adoption.
+
 ## Important Caveat
 
 > [!CAUTION]

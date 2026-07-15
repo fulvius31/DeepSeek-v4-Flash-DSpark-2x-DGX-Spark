@@ -1,0 +1,109 @@
+# Graft the fork's custom FlashInfer sparse_mla_sm120 Python glue into upstream's
+# 0.6.14 image. Upstream 0.6.14 ALREADY ships the sparse_mla_sm120 CUDA kernels
+# (23 sources) and one trace template (paged); it only lacks the Python wrapper
+# (BatchSparseMLAPagedAttentionWrapper), the JIT generator, and the
+# decode_dsv4 trace template. Those expose the multi-query sparse-MLA decode
+# (num_tokens<=64) that the raw trtllm_batch_decode_sparse_mla_dsv4 call cannot do.
+ARG FORK_IMAGE=vllm-dspark-runtime:dspark-nvfp4-stage-c
+ARG BASE_IMAGE=vllm-upstream-gb10:dspark-tp-fi0615
+FROM ${FORK_IMAGE} AS forksrc
+FROM ${BASE_IMAGE}
+
+ARG FI=/usr/local/lib/python3.12/dist-packages/flashinfer
+ARG FORK_FI=/opt/env/lib/python3.12/site-packages/flashinfer
+
+# 1. the wrapper module + JIT generator (pure python)
+COPY --from=forksrc ${FORK_FI}/sparse_mla_sm120.py ${FI}/sparse_mla_sm120.py
+COPY --from=forksrc ${FORK_FI}/jit/sparse_mla_sm120.py ${FI}/jit/sparse_mla_sm120.py
+# re-export the wrapper at top level (the fork's __init__ does this)
+RUN python3 - <<'PY'
+from pathlib import Path
+ip = Path("/usr/local/lib/python3.12/dist-packages/flashinfer/__init__.py")
+s = ip.read_text()
+if "BatchSparseMLAPagedAttentionWrapper" not in s:
+    ip.write_text(s.rstrip() + "\n\nfrom .sparse_mla_sm120 import BatchSparseMLAPagedAttentionWrapper  # noqa: E402,F401\n")
+    print("added top-level BatchSparseMLAPagedAttentionWrapper export")
+else:
+    print("top-level export already present")
+PY
+
+# 1b. the fork's MATCHED CUDA sources (5 .cu + header tree). The compiled kernel
+# binding must match the fork's wrapper's call arg-count; upstream's 0.6.14
+# sources have a different signature. These only externally #include
+# tvm_ffi_utils.h (shared) + standard CUDA, so they compile against 0.6.14.
+COPY --from=forksrc ${FORK_FI}/data/csrc/sparse_mla_sm120.cu ${FI}/data/csrc/sparse_mla_sm120.cu
+COPY --from=forksrc ${FORK_FI}/data/csrc/sparse_mla_sm120_decode_dsv3_2.cu ${FI}/data/csrc/sparse_mla_sm120_decode_dsv3_2.cu
+COPY --from=forksrc ${FORK_FI}/data/csrc/sparse_mla_sm120_decode_dsv4.cu ${FI}/data/csrc/sparse_mla_sm120_decode_dsv4.cu
+COPY --from=forksrc ${FORK_FI}/data/csrc/sparse_mla_sm120_prefill.cu ${FI}/data/csrc/sparse_mla_sm120_prefill.cu
+COPY --from=forksrc ${FORK_FI}/data/csrc/sparse_mla_sm120_jit_binding.cu ${FI}/data/csrc/sparse_mla_sm120_jit_binding.cu
+COPY --from=forksrc ${FORK_FI}/data/include/flashinfer/attention/sparse_mla_sm120 ${FI}/data/include/flashinfer/attention/sparse_mla_sm120
+# remove the 0.6.15 AOT-precompiled sparse_mla_sm120 module so build_and_load()
+# JIT-compiles the fork's MATCHED 0.6.12 sources (11-arg kernel) instead of the
+# skewed 0.6.15 AOT kernel (12-arg). Keeps the fork wrapper+kernel consistent.
+RUN rm -rf /usr/local/lib/python3.12/dist-packages/flashinfer_jit_cache/jit_cache/sparse_mla_sm120 \
+    && echo "removed AOT sparse_mla_sm120 module (force JIT of fork sources)"
+
+# 2. the missing decode_dsv4 trace template (append to upstream's attention.py)
+COPY fi_decode_dsv4_trace.py /tmp/fi_decode_dsv4_trace.py
+RUN python3 - <<'PY'
+from pathlib import Path
+tp = Path("/usr/local/lib/python3.12/dist-packages/flashinfer/trace/templates/attention.py")
+src = tp.read_text()
+if "sparse_mla_sm120_decode_dsv4_trace = TraceTemplate(" not in src:
+    block = Path("/tmp/fi_decode_dsv4_trace.py").read_text()
+    tp.write_text(src.rstrip() + "\n\n\n" + block)
+    print("appended decode_dsv4 trace template")
+else:
+    print("decode_dsv4 trace template already present")
+# sanity: the file still parses
+import ast; ast.parse(tp.read_text())
+print("attention.py parses OK")
+PY
+
+# 3. the DSV4 decode adapter + patch _forward_decode to use the wrapper
+COPY sparse_mla_sm120_decode.py ${FI}/../vllm/models/deepseek_v4/nvidia/sparse_mla_sm120_decode.py
+RUN python3 - <<'PY'
+from pathlib import Path
+p = Path("/usr/local/lib/python3.12/dist-packages/vllm/models/deepseek_v4/nvidia/flashinfer_sparse.py")
+src = p.read_text()
+anchor = (
+    "        if extra_cache is not None and extra_sparse_indices is None:\n"
+    "            raise RuntimeError(\n"
+    "                \"Compressed sparse MLA decode requires compressed sparse indices.\"\n"
+    "            )\n"
+    "        flashinfer_trtllm_batch_decode_sparse_mla_dsv4(\n"
+)
+assert src.count(anchor) == 1, f"anchor count={src.count(anchor)}"
+branch = (
+    "        if _sm120_use_wrapper_decode():\n"
+    "            from vllm.models.deepseek_v4.nvidia.sparse_mla_sm120_decode import (\n"
+    "                sm120_wrapper_decode,\n"
+    "            )\n"
+    "            sm120_wrapper_decode(\n"
+    "                self,\n"
+    "                q=q,\n"
+    "                swa_kv_cache=self.swa_cache_layer.kv_cache,\n"
+    "                indexed_kv_cache=kv_cache,\n"
+    "                swa_indices=swa_indices,\n"
+    "                swa_lens=swa_lens,\n"
+    "                extra_sparse_indices=extra_sparse_indices,\n"
+    "                extra_sparse_lengths=extra_sparse_lengths,\n"
+    "                output=output,\n"
+    "            )\n"
+    "            return\n"
+)
+new_anchor = anchor[:-len("        flashinfer_trtllm_batch_decode_sparse_mla_dsv4(\n")] \
+    + branch + "        flashinfer_trtllm_batch_decode_sparse_mla_dsv4(\n"
+src = src.replace(anchor, new_anchor, 1)
+imp = ("from vllm.models.deepseek_v4.nvidia.sparse_mla_sm120_decode import (\n"
+       "    use_sm120_wrapper_decode as _sm120_use_wrapper_decode,\n)\n")
+a2 = "\nimport torch\n"
+assert src.count(a2) >= 1
+src = src.replace(a2, a2 + "\n" + imp, 1)
+p.write_text(src)
+import ast; ast.parse(src)
+print("patched _forward_decode with sm120 wrapper branch; syntax OK")
+PY
+
+# 4. import test (JIT CUDA build is deferred to runtime warmup — needs a GPU)
+RUN python3 -c "from flashinfer.sparse_mla_sm120 import BatchSparseMLAPagedAttentionWrapper; from flashinfer.jit.sparse_mla_sm120 import gen_sparse_mla_sm120_module; from vllm.models.deepseek_v4.nvidia import sparse_mla_sm120_decode, flashinfer_sparse; print('wrapper + jit + adapter + patched flashinfer_sparse import OK')"

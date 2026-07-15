@@ -66,6 +66,51 @@ DOCKER_BUILDKIT=1 docker build \
   -t vllm-upstream-gb10:dspark-tp .
 ```
 
+> **FlashInfer version skew (validated 2026-07-14) — required for the real model.**
+> The branch's DeepSeek-V4 sparse-MLA decode (`flashinfer_sparse.py`, from vLLM
+> PR #43477) calls `trtllm_batch_decode_sparse_mla_dsv4()` with the *split*
+> signature (`swa_topk_lens`, `extra_sparse_indices`, `extra_sparse_topk_lens`),
+> which exists only in **flashinfer >= 0.6.14**. The branch pins **0.6.13**
+> (`docker/versions.json`, `requirements/cuda.txt`), whose signature is the older
+> *unified* one — so the tiny model passes every gate but the **real model
+> crashes at the first decode** with `unexpected keyword argument 'swa_topk_lens'`.
+> FlashInfer is a runtime-JIT pip layer, so the fix is a fast overlay, not a
+> rebuild — see `recipe/Dockerfile.upstream-flashinfer-0614`:
+> ```bash
+> docker build -f recipe/Dockerfile.upstream-flashinfer-0614 \
+>   -t vllm-upstream-gb10:dspark-tp-fi0614 recipe/
+> ```
+> (bumps `flashinfer-python` + `flashinfer-jit-cache` to 0.6.14+cu130 and drops
+> `flashinfer-cubin`, which has no 0.6.14 and would trip flashinfer's cubin==python
+> check). With this image, **base inference serves the real model correctly**
+> (`UPSTREAM_IMAGE=vllm-upstream-gb10:dspark-tp-fi0614`).
+>
+> **Speculative decode remains blocked on GB10 (SM121)** — validated
+> exhaustively 2026-07-15, conclusion: no fix available today.
+> - FlashInfer SM120 sparse-MLA decode (the *only* backend the branch selects on
+>   capability major=12) supports single-query decode (`q_len=1`) and prefill
+>   (`num_tokens>64`) but **not multi-query decode** (`1 < q_len <= 64`), which
+>   the MTP speculative *verify* step needs. Fails in the spec warmup with
+>   `Check failed: num_tokens > 64 (5 vs. 64) : Decode ... must go through
+>   sparse_mla_sm120_decode_dsv4; got num_tokens=5` (5 = `num_speculative_tokens`).
+> - Same failure on **FlashInfer 0.6.15 nightly** (`0.6.15.dev20260712`, newest
+>   available; recipe/Dockerfile.upstream-flashinfer-0615) — the multi-query
+>   kernel isn't in it either.
+> - Forcing the **FlashMLA** backend (`--attention-backend FLASHMLA_SPARSE_DSV4`)
+>   gets past the FlashInfer kernel but the branch **deliberately disables
+>   FlashMLA's tile scheduler on capability family 120** (`sparse_swa.py`
+>   `build_tile_scheduler`: `... or current_platform.is_device_capability_family(120):
+>   return out` all-None) — FlashMLA's kernels are Hopper, not Blackwell SM121 —
+>   so it dies with `swa_metadata missing tile_sched entry for compress_ratio=1`.
+> - Upstream's TileLang is wired only to the MHC indexer, not sparse-MLA decode.
+>
+> So on GB10/SM121 the upstream lane is **base-inference-only** until FlashInfer
+> ships a multi-query sparse-MLA SM120 decode kernel (or DeepSeek adds SM121
+> FlashMLA). The fork stack keeps working speculation via its own
+> TileLang/B12X sparse-MLA kernel, which handles the multi-query verify shape.
+> Use `UPSTREAM_IMAGE=vllm-upstream-gb10:dspark-tp-fi0614` for base serving;
+> do NOT pass `--speculative-config` on this hardware yet.
+
 Notes:
 - `max_jobs`/`nvcc_threads` tuned for the 20-core Grace CPU and 128 GB unified
   memory — raise cautiously; nvcc under parallel load is RAM-hungry.

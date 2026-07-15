@@ -1,0 +1,22 @@
+# Overlay: FlashInfer 0.6.15 nightly on the upstream GB10 image.
+#
+# 0.6.14 fixed the decode SIGNATURE (base inference serves) but its SM120 sparse
+# MLA decode kernel rejects the multi-query spec-verify shape (num_tokens=5,
+# q_len>1) with "num_tokens > 64" -- blocking speculative decode. 0.6.15 (only a
+# nightly dev wheel exists so far) carries post-0.6.14 MLA-decode-autotuning
+# commits (#3582, #3726); try it to see if it handles multi-query sparse decode.
+ARG BASE_IMAGE=vllm-upstream-gb10:dspark-tp
+FROM ${BASE_IMAGE}
+
+ARG FI=0.6.15.dev20260712
+# 0.6.15 adds a cuda-tile>=1.4 dependency, published on NVIDIA's index.
+RUN pip uninstall -y flashinfer-cubin \
+    && pip install --no-cache-dir --pre \
+        "flashinfer-python==${FI}" \
+        --index-url https://flashinfer.ai/whl/nightly \
+        --extra-index-url https://pypi.nvidia.com \
+        --extra-index-url https://pypi.org/simple \
+    && pip install --no-cache-dir --pre \
+        "flashinfer-jit-cache==${FI}+cu130" \
+        --index-url https://flashinfer.ai/whl/nightly/cu130 \
+    && python3 -c "import flashinfer, inspect; from flashinfer.mla import _core; s=inspect.getsource(_core.trtllm_batch_decode_sparse_mla_dsv4); assert 'swa_topk_lens' in s and 'extra_sparse_indices' in s, 'SPLIT signature missing'; print('flashinfer', flashinfer.__version__, 'SPLIT signature OK')"

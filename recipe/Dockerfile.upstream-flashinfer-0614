@@ -1,0 +1,25 @@
+# Overlay: bump FlashInfer 0.6.13 -> 0.6.14 on the upstream GB10 image.
+#
+# The branch's DeepSeek-V4 sparse-MLA decode (flashinfer_sparse.py) calls
+# trtllm_batch_decode_sparse_mla_dsv4() with the SPLIT signature
+# (swa_topk_lens=, extra_sparse_indices=, extra_sparse_topk_lens=), which only
+# exists in flashinfer >= 0.6.14. The branch pins 0.6.13 (UNIFIED signature:
+# sparse_topk_lens + required seq_lens), so the real model crashes at first
+# decode. FlashInfer is a runtime-JIT dependency installed as a pip layer, so
+# this bump is an overlay, not a full rebuild.
+#
+# cubin has no 0.6.14 (optional AOT cache; missing entries fall back to the
+# 0.6.14 jit-cache), so only python + jit-cache are bumped.
+ARG BASE_IMAGE=vllm-upstream-gb10:dspark-tp
+FROM ${BASE_IMAGE}
+
+# cubin 0.6.14 does not exist; flashinfer enforces cubin==python, so remove the
+# optional AOT cubin bundle. Kernels then come from the 0.6.14 jit-cache
+# (the TRTLLM-gen sparse-MLA decode kernel lives there anyway).
+RUN pip uninstall -y flashinfer-cubin \
+    && pip install --no-cache-dir \
+        flashinfer-python==0.6.14 \
+    && pip install --no-cache-dir \
+        flashinfer-jit-cache==0.6.14+cu130 \
+        --index-url https://flashinfer.ai/whl/cu130 \
+    && python3 -c "import flashinfer, inspect; from flashinfer.mla import _core; s=inspect.getsource(_core.trtllm_batch_decode_sparse_mla_dsv4); assert 'swa_topk_lens' in s and 'extra_sparse_indices' in s, 'SPLIT signature missing'; print('flashinfer', flashinfer.__version__, 'SPLIT signature OK')"

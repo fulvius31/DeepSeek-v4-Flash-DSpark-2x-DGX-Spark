@@ -105,11 +105,39 @@ DOCKER_BUILDKIT=1 docker build \
 > - Upstream's TileLang is wired only to the MHC indexer, not sparse-MLA decode.
 >
 > So on GB10/SM121 the upstream lane is **base-inference-only** until FlashInfer
-> ships a multi-query sparse-MLA SM120 decode kernel (or DeepSeek adds SM121
-> FlashMLA). The fork stack keeps working speculation via its own
-> TileLang/B12X sparse-MLA kernel, which handles the multi-query verify shape.
-> Use `UPSTREAM_IMAGE=vllm-upstream-gb10:dspark-tp-fi0614` for base serving;
-> do NOT pass `--speculative-config` on this hardware yet.
+> ships a multi-query sparse-MLA SM120 decode kernel. Use
+> `UPSTREAM_IMAGE=vllm-upstream-gb10:dspark-tp-fi0614` for base serving; do NOT
+> pass `--speculative-config` on this hardware yet.
+>
+> **Root cause of the fork's speculation working, traced to the bottom
+> (2026-07-15).** The fork does NOT use B12X for decode
+> (`VLLM_DSV4_B12X_COMPRESSED_MLA=0` in its validated config; B12X is an opt-in
+> branch that, when forced on, TP-hangs). The fork's multi-query sparse-MLA
+> decode comes from a **custom FlashInfer patch**: `flashinfer/sparse_mla_sm120.py`
+> (~990 lines) defining `BatchSparseMLAPagedAttentionWrapper`, which JIT-builds
+> custom CUDA kernels (`sparse_mla_sm120_decode_dsv4` / `_dsv3_2` /
+> `_paged_attention`, from `include/flashinfer/attention/sparse_mla_sm120/*.cuh`)
+> and dispatches the `num_tokens <= 64` multi-query case correctly. This module
+> is **absent from every public FlashInfer** (0.6.12/0.6.14/0.6.15) and from the
+> upstream branch, which calls the raw `trtllm_batch_decode_sparse_mla_dsv4`
+> kernel that hard-asserts `num_tokens > 64`.
+>
+> Everything tried to reach upstream speculation traced back to this one gap:
+> - FlashInfer 0.6.14/0.6.15 (nightly): no multi-query sparse decode.
+> - FlashMLA backend: branch-disabled on capability family 120 (Hopper-only).
+> - Rebase onto current vLLM main: main lacks the wrapper/kernels too
+>   (only 24 commits ahead; no `VLLM_TRITON_MLA_SPARSE`, no Triton sparse decode).
+> - B12X port (recipe/Dockerfile.upstream-b12x + b12x_sparse_decode.py): cleared
+>   the `num_tokens>64` assertion (the b12x kernel handles multi-query!) and the
+>   server started with spec, but the decode TP-hangs (worker spins, head waits)
+>   even under `--enforce-eager` -- and B12X isn't the fork's real path anyway.
+>
+> Closing the gap upstream requires grafting the fork's custom FlashInfer
+> sparse-MLA-SM120 kernel suite (Python wrapper + JIT CUDA sources + build infra)
+> into the image, or FlashInfer upstreaming it. That is a kernel-porting project,
+> not a config or small-code change. The fork stack (this repo) is the working
+> multi-query sparse-decode implementation; it remains the speculation path on
+> GB10.
 
 Notes:
 - `max_jobs`/`nvcc_threads` tuned for the 20-core Grace CPU and 128 GB unified

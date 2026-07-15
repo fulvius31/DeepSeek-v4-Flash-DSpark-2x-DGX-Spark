@@ -14,6 +14,8 @@ services:
       - ${HF_CACHE:-${HOME}/.cache/huggingface}:/cache/huggingface
     environment:
       HF_HOME: /cache/huggingface
+      TORCHINDUCTOR_STATIC_CUDA_LAUNCHER: "${TORCHINDUCTOR_STATIC_CUDA_LAUNCHER:-0}"
+      VLLM_DSV4_B12X_COMPRESSED_MLA: "${VLLM_DSV4_B12X_COMPRESSED_MLA:-0}"
       VLLM_ATTENTION_BACKEND: "${VLLM_ATTENTION_BACKEND:-}"
       HF_HUB_OFFLINE: "1"
       VLLM_HOST_IP: "${VLLM_HOST_IP:-}"
@@ -45,6 +47,7 @@ services:
         --tensor-parallel-size 2
         --pipeline-parallel-size 1
         --attention-backend ${ATTENTION_BACKEND:-auto}
+        ${ENFORCE_EAGER:+--enforce-eager}
         --kv-cache-dtype fp8_ds_mla
         --max-model-len ${MAX_MODEL_LEN:-200000}
         --max-num-seqs ${MAX_NUM_SEQS:-6}

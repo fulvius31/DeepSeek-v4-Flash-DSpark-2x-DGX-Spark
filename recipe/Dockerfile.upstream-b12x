@@ -1,0 +1,78 @@
+# Route the upstream DSV4 SM120 decode through the fork's b12x TileLang kernel
+# (multi-query capable) instead of FlashInfer's SM120 sparse decode, which lacks
+# the 2..64 multi-query band the MTP speculative verify needs.
+#
+# Minimal port: the b12x package (pure python) + a clean adapter that calls
+# b12x's compressed_mla_decode_forward from the SAME data upstream already
+# computes in _forward_decode. No fork vLLM class files (they diverged); no
+# kernel build. Gated by VLLM_DSV4_B12X_COMPRESSED_MLA=1.
+ARG FORK_IMAGE=vllm-dspark-runtime:dspark-nvfp4-stage-c
+ARG BASE_IMAGE=vllm-upstream-gb10:dspark-tp-fi0615
+FROM ${FORK_IMAGE} AS forksrc
+FROM ${BASE_IMAGE}
+
+ARG VLLM_SITE=/usr/local/lib/python3.12/dist-packages
+
+# 1. the b12x package (pure python; JIT via TileLang at runtime)
+COPY --from=forksrc /opt/env/lib/python3.12/site-packages/b12x ${VLLM_SITE}/b12x
+
+# 2. the adapter module
+COPY b12x_sparse_decode.py ${VLLM_SITE}/vllm/models/deepseek_v4/nvidia/b12x_sparse_decode.py
+
+# 3. patch _forward_decode to branch into b12x when the env flag is set
+RUN python3 - <<'PY'
+from pathlib import Path
+p = Path("/usr/local/lib/python3.12/dist-packages/vllm/models/deepseek_v4/nvidia/flashinfer_sparse.py")
+src = p.read_text()
+# Unique anchor: the SM120 _forward_decode's compressed-indices guard, right
+# before its flashinfer decode call. (The bare call string is NOT unique -- it
+# is a substring of three 12-space-indented calls elsewhere.)
+anchor = (
+    "        if extra_cache is not None and extra_sparse_indices is None:\n"
+    "            raise RuntimeError(\n"
+    "                \"Compressed sparse MLA decode requires compressed sparse indices.\"\n"
+    "            )\n"
+    "        flashinfer_trtllm_batch_decode_sparse_mla_dsv4(\n"
+)
+assert src.count(anchor) == 1, f"anchor count={src.count(anchor)}"
+branch = (
+    "        if _b12x_use_compressed_mla():\n"
+    "            from vllm.models.deepseek_v4.nvidia.b12x_sparse_decode import (\n"
+    "                b12x_compressed_decode,\n"
+    "            )\n"
+    "            _b12x_indexed_page_size = None\n"
+    "            if kv_cache is not None and attn_metadata is not None:\n"
+    "                _b12x_indexed_page_size = (\n"
+    "                    attn_metadata.block_size // self.compress_ratio\n"
+    "                )\n"
+    "            b12x_compressed_decode(\n"
+    "                self,\n"
+    "                q=q,\n"
+    "                swa_kv_cache=self.swa_cache_layer.kv_cache,\n"
+    "                indexed_kv_cache=kv_cache,\n"
+    "                swa_indices=swa_indices,\n"
+    "                swa_lens=swa_lens,\n"
+    "                extra_sparse_indices=extra_sparse_indices,\n"
+    "                extra_sparse_lengths=extra_sparse_lengths,\n"
+    "                swa_page_size=swa_metadata.block_size,\n"
+    "                indexed_page_size=_b12x_indexed_page_size,\n"
+    "                output=output,\n"
+    "            )\n"
+    "            return\n"
+)
+# insert the branch just before the flashinfer call within the anchor block
+new_anchor = anchor[:-len("        flashinfer_trtllm_batch_decode_sparse_mla_dsv4(\n")] \
+    + branch + "        flashinfer_trtllm_batch_decode_sparse_mla_dsv4(\n"
+src = src.replace(anchor, new_anchor, 1)
+# module-load import of the env helper
+imp = ("from vllm.models.deepseek_v4.nvidia.b12x_sparse_decode import (\n"
+       "    use_b12x_compressed_mla as _b12x_use_compressed_mla,\n)\n")
+anchor2 = "\nimport torch\n"
+assert src.count(anchor2) >= 1
+src = src.replace(anchor2, anchor2 + "\n" + imp, 1)
+p.write_text(src)
+import ast; ast.parse(src)
+print("patched _forward_decode with b12x branch; syntax OK")
+PY
+
+RUN python3 -c "import b12x; from vllm.models.deepseek_v4.nvidia import b12x_sparse_decode, flashinfer_sparse; print('b12x adapter + patched flashinfer_sparse import OK')"
